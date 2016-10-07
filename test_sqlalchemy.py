@@ -1,11 +1,12 @@
 from __future__ import with_statement
 
-import os
 import atexit
 import unittest
 from datetime import datetime
 import flask
-from flask.ext import sqlalchemy
+import flask_sqlalchemy as sqlalchemy
+from sqlalchemy import MetaData
+from sqlalchemy.ext.declarative import declared_attr
 from sqlalchemy.orm import sessionmaker
 
 def make_todo_model(db):
@@ -80,6 +81,63 @@ class BasicAppTestCase(unittest.TestCase):
         self.assertEqual(self.db.metadata, self.db.Model.metadata)
 
 
+class CustomMetaDataTestCase(unittest.TestCase):
+
+    def setUp(self):
+        self.app = flask.Flask(__name__)
+        self.app.config['SQLALCHEMY_ENGINE'] = 'sqlite://'
+        self.app.config['TESTING'] = True
+
+    def test_custom_metadata_positive(self):
+
+        convention = {
+            "ix": 'ix_%(column_0_label)s',
+            "uq": "uq_%(table_name)s_%(column_0_name)s",
+            "ck": "ck_%(table_name)s_%(constraint_name)s",
+            "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
+            "pk": "pk_%(table_name)s"
+        }
+
+        metadata = MetaData(naming_convention=convention)
+        db = sqlalchemy.SQLAlchemy(self.app, metadata=metadata)
+        self.db = db
+
+        class One(db.Model):
+            id = db.Column(db.Integer, primary_key=True)
+            myindex = db.Column(db.Integer, index=True)
+
+        class Two(db.Model):
+            id = db.Column(db.Integer, primary_key=True)
+            one_id = db.Column(db.Integer, db.ForeignKey(One.id))
+            myunique = db.Column(db.Integer, unique=True)
+
+        self.assertEqual(list(One.__table__.constraints)[0].name, 'pk_one')
+        self.assertEqual(list(One.__table__.indexes)[0].name, 'ix_one_myindex')
+
+        self.assertTrue('fk_two_one_id_one' in [c.name for c in Two.__table__.constraints])
+        self.assertTrue('uq_two_myunique' in [c.name for c in Two.__table__.constraints])
+        self.assertTrue('pk_two' in [c.name for c in Two.__table__.constraints])
+
+    def test_custom_metadata_negative(self):
+        db = sqlalchemy.SQLAlchemy(self.app, metadata=None)
+        self.db = db
+
+        class One(db.Model):
+            id = db.Column(db.Integer, primary_key=True)
+            myindex = db.Column(db.Integer, index=True)
+
+        class Two(db.Model):
+            id = db.Column(db.Integer, primary_key=True)
+            one_id = db.Column(db.Integer, db.ForeignKey(One.id))
+            myunique = db.Column(db.Integer, unique=True)
+
+        self.assertNotEqual(list(One.__table__.constraints)[0].name, 'pk_one')
+
+        self.assertFalse('fk_two_one_id_one' in [c.name for c in Two.__table__.constraints])
+        self.assertFalse('uq_two_myunique' in [c.name for c in Two.__table__.constraints])
+        self.assertFalse('pk_two' in [c.name for c in Two.__table__.constraints])
+
+
 class TestQueryProperty(unittest.TestCase):
 
     def setUp(self):
@@ -128,6 +186,19 @@ class SignallingTestCase(unittest.TestCase):
     def tearDown(self):
         self.db.drop_all()
 
+    def test_before_committed(self):
+        class Namespace(object):
+            is_received = False
+
+        def before_committed(sender, changes):
+            Namespace.is_received = True
+
+        with sqlalchemy.before_models_committed.connected_to(before_committed, sender=self.app):
+            todo = self.Todo('Awesome', 'the text')
+            self.db.session.add(todo)
+            self.db.session.commit()
+            self.assertTrue(Namespace.is_received)
+
     def test_model_signals(self):
         recorded = []
         def committed(sender, changes):
@@ -171,20 +242,108 @@ class SignallingTestCase(unittest.TestCase):
         self.assertEqual(seen, [db.session()])
 
 
-class HelperTestCase(unittest.TestCase):
-
-    def test_default_table_name(self):
+class TablenameTestCase(unittest.TestCase):
+    def test_name(self):
         app = flask.Flask(__name__)
-        app.config['SQLALCHEMY_ENGINE'] = 'sqlite://'
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite://'
         db = sqlalchemy.SQLAlchemy(app)
 
         class FOOBar(db.Model):
             id = db.Column(db.Integer, primary_key=True)
+
         class BazBar(db.Model):
+            id = db.Column(db.Integer, primary_key=True)
+
+        class Ham(db.Model):
+            __tablename__ = 'spam'
             id = db.Column(db.Integer, primary_key=True)
 
         self.assertEqual(FOOBar.__tablename__, 'foo_bar')
         self.assertEqual(BazBar.__tablename__, 'baz_bar')
+        self.assertEqual(Ham.__tablename__, 'spam')
+
+    def test_single_name(self):
+        """Single table inheritance should not set a new name."""
+
+        app = flask.Flask(__name__)
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite://'
+        db = sqlalchemy.SQLAlchemy(app)
+
+        class Duck(db.Model):
+            id = db.Column(db.Integer, primary_key=True)
+
+        class Mallard(Duck):
+            pass
+
+        self.assertEqual(Mallard.__tablename__, 'duck')
+
+    def test_joined_name(self):
+        """Model has a separate primary key; it should set a new name."""
+
+        app = flask.Flask(__name__)
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite://'
+        db = sqlalchemy.SQLAlchemy(app)
+
+        class Duck(db.Model):
+            id = db.Column(db.Integer, primary_key=True)
+
+        class Donald(Duck):
+            id = db.Column(db.Integer, db.ForeignKey(Duck.id), primary_key=True)
+
+        self.assertEqual(Donald.__tablename__, 'donald')
+
+    def test_mixin_name(self):
+        """Primary key provided by mixin should still allow model to set tablename."""
+
+        app = flask.Flask(__name__)
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite://'
+        db = sqlalchemy.SQLAlchemy(app)
+
+        class Base(object):
+            id = db.Column(db.Integer, primary_key=True)
+
+        class Duck(Base, db.Model):
+            pass
+
+        self.assertFalse(hasattr(Base, '__tablename__'))
+        self.assertEqual(Duck.__tablename__, 'duck')
+
+    def test_abstract_name(self):
+        """Abstract model should not set a name.  Subclass should set a name."""
+
+        app = flask.Flask(__name__)
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite://'
+        db = sqlalchemy.SQLAlchemy(app)
+
+        class Base(db.Model):
+            __abstract__ = True
+            id = db.Column(db.Integer, primary_key=True)
+
+        class Duck(Base):
+            pass
+
+        self.assertFalse(hasattr(Base, '__tablename__'))
+        self.assertEqual(Duck.__tablename__, 'duck')
+
+    def test_complex_inheritance(self):
+        """Joined table inheritance, but the new primary key is provided by a mixin, not directly on the class."""
+
+        app = flask.Flask(__name__)
+        app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite://'
+        db = sqlalchemy.SQLAlchemy(app)
+
+        class Duck(db.Model):
+            id = db.Column(db.Integer, primary_key=True)
+
+        class IdMixin(object):
+            @declared_attr
+            def id(cls):
+                return db.Column(db.Integer, db.ForeignKey(Duck.id), primary_key=True)
+
+        class RubberDuck(IdMixin, Duck):
+            pass
+
+        self.assertEqual(RubberDuck.__tablename__, 'rubber_duck')
 
 
 class PaginationTestCase(unittest.TestCase):
@@ -206,6 +365,34 @@ class PaginationTestCase(unittest.TestCase):
     def test_pagination_pages_when_0_items_per_page(self):
         p = sqlalchemy.Pagination(None, 1, 0, 500, [])
         self.assertEqual(p.pages, 0)
+
+    def test_query_paginate(self):
+        app = flask.Flask(__name__)
+        db = sqlalchemy.SQLAlchemy(app)
+        Todo = make_todo_model(db)
+        db.create_all()
+
+        with app.app_context():
+            db.session.add_all([Todo('', '') for _ in range(100)])
+            db.session.commit()
+
+        @app.route('/')
+        def index():
+            p = Todo.query.paginate()
+            return '{0} items retrieved'.format(len(p.items))
+
+        c = app.test_client()
+        # request default
+        r = c.get('/')
+        self.assertEqual(r.status_code, 200)
+        # request args
+        r = c.get('/?per_page=10')
+        self.assertEqual(r.data.decode('utf8'), '10 items retrieved')
+
+        with app.app_context():
+            # query default
+            p = Todo.query.paginate()
+            self.assertEqual(p.total, 100)
 
 
 class BindsTestCase(unittest.TestCase):
@@ -318,7 +505,7 @@ class SQLAlchemyIncludesTestCase(unittest.TestCase):
         self.assertTrue(db.Column == sqlalchemy_lib.Column)
 
         # The Query object we expose is actually our own subclass.
-        from flask.ext.sqlalchemy import BaseQuery
+        from flask_sqlalchemy import BaseQuery
         self.assertTrue(db.Query == BaseQuery)
 
 
@@ -505,8 +692,9 @@ class StandardSessionTestCase(unittest.TestCase):
 def suite():
     suite = unittest.TestSuite()
     suite.addTest(unittest.makeSuite(BasicAppTestCase))
+    suite.addTest(unittest.makeSuite(CustomMetaDataTestCase))
     suite.addTest(unittest.makeSuite(TestQueryProperty))
-    suite.addTest(unittest.makeSuite(HelperTestCase))
+    suite.addTest(unittest.makeSuite(TablenameTestCase))
     suite.addTest(unittest.makeSuite(PaginationTestCase))
     suite.addTest(unittest.makeSuite(BindsTestCase))
     suite.addTest(unittest.makeSuite(DefaultQueryClassTestCase))
